@@ -33,7 +33,7 @@ pub enum Error {
     /// Error indicating invalid interpolation parameters, with a descriptive message.
     #[error("Invalid interpolation parameters: {0}")]
     InterpolationError(String),
-    /// Error indicating that original Q knots do not square to the subgrids' stored Q² knots.
+    /// Error indicating that original Q knots do not square to the subgrids' stored Q^2 knots.
     #[error("Q knots do not match the Q² knots of the subgrids")]
     InconsistentQKnots,
 }
@@ -140,7 +140,7 @@ impl GridArray {
     /// Attaches each subgrid's original unsquared Q knots, as returned by
     /// [`crate::parser::LhapdfSet::read_data_with_q_knots`].
     ///
-    /// Every knot must square, in binary64, to the subgrid's stored Q² knot. The
+    /// Every knot must square, in binary64, to the subgrid's stored Q^2 knot. The
     /// precision-generic path ([`crate::precision_pdf`]) then squares them in its own
     /// arithmetic, so that PDF and αs thresholds given by the same Q stay identical.
     pub fn with_q_knots(mut self, q_knots: Vec<Vec<f64>>) -> Result<Self, Error> {
@@ -159,11 +159,13 @@ impl GridArray {
         Ok(self)
     }
 
-    /// The original unsquared Q knots of subgrid `index`, if they were attached.
+    /// The original unsquared Q knots of subgrid `index`, if they were attached; `None` as well for an
+    /// index without a subgrid.
     pub fn q_knots(&self, index: usize) -> Option<&[f64]> {
         self.q_knots
             .as_ref()
-            .map(|q_knots| q_knots[index].as_slice())
+            .and_then(|q_knots| q_knots.get(index))
+            .map(Vec::as_slice)
     }
 
     /// Creates a new `GridArray` from a vector of `SubgridData`.
@@ -359,16 +361,11 @@ fn build_interleaved(
     match config {
         InterpolationConfig::TwoD => {
             let extra_grids = vec![log_q2s];
-            let grid = subgrid.grid.view();
-            let is_8d = subgrid.is_8d();
+            // The (x, Q^2) plane of each flavour slot, as `SubGrid::grid_slice` lays it out.
+            let planes: Vec<_> = (0..n_pids).map(|pid| subgrid.grid_slice(pid)).collect();
             let interleaved =
                 InterleavedHermite::build(log_xs, extra_grids, n_pids, |pid, x_idx, extra| {
-                    let q2_idx = extra[0];
-                    if is_8d {
-                        grid[[0, 0, 0, 0, 0, pid, x_idx, q2_idx]]
-                    } else {
-                        grid[[0, 0, pid, 0, x_idx, q2_idx]]
-                    }
+                    planes[pid][[x_idx, extra[0]]]
                 });
             Some(interleaved)
         }
@@ -1099,6 +1096,17 @@ impl GridPDF {
         }
     }
 
+    /// Prepares this grid's collinear `xfxq2` and `alphas_q2` in the arithmetic `a`: every subgrid
+    /// and the alpha_s table are rebuilt from the fixed binary64 data in `a` (see
+    /// [`crate::precision_pdf`] for the supported class).
+    pub fn with_arithmetic<A: crate::precision::Arithmetic + Clone>(
+        &self,
+        a: A,
+    ) -> Result<crate::precision_pdf::PrecisionPDF<'_, A>, crate::precision_pdf::PrecisionError>
+    {
+        crate::precision_pdf::PrecisionPDF::new(self, a)
+    }
+
     /// Gets the alpha_s value at a given `Q²`.
     ///
     /// # Arguments
@@ -1108,16 +1116,6 @@ impl GridPDF {
     /// # Returns
     ///
     /// The interpolated alpha_s value.
-    /// Prepares this grid's collinear `xfxq2` and `alphas_q2` path in the arithmetic `a`
-    /// (see [`crate::precision_pdf`]).
-    pub fn with_arithmetic<A: crate::precision::Arithmetic + Clone>(
-        &self,
-        a: A,
-    ) -> Result<crate::precision_pdf::PrecisionPDF<'_, A>, crate::precision_pdf::PrecisionError>
-    {
-        crate::precision_pdf::PrecisionPDF::new(self, a)
-    }
-
     pub fn alphas_q2(&self, q2: f64) -> f64 {
         self.alphas.alphas_q2(q2)
     }

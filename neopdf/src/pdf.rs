@@ -251,7 +251,7 @@ impl PDF {
             let (pdf_data, q_knots) = LhapdfSet::read_data_with_q_knots(path);
             let knot_array = GridArray::new(pdf_data.subgrid_data, pdf_data.pids)
                 .with_q_knots(q_knots)
-                .expect("the parser's Q² knots are the squares of its Q knots");
+                .expect("the parser's Q^2 knots are the squares of its Q knots");
 
             let mut info = info;
             if info.alphas_vals.is_empty() {

@@ -7,7 +7,7 @@
 //! it reproduces the binary64 path; with a wider arithmetic it evaluates the same fixed binary64
 //! dataset more accurately.
 //!
-//! Supported class: sets with the `LogBicubic` interpolator whose subgrids are all `(x, Q²)` grids
+//! Supported class: sets with the `LogBicubic` interpolator whose subgrids are all `(x, Q^2)` grids
 //! (one nucleon number, one αs value, collinear), and tabulated αs. Anything else is reported as
 //! [`PrecisionError::Unsupported`] when the view is prepared, or for αs when it is evaluated.
 //!
@@ -17,7 +17,7 @@
 //! - Thresholds: where the set was read from LHAPDF `.dat` files, the original Q knots are squared
 //!   in the selected arithmetic, for the subgrids and for αs alike, so a threshold given by one Q
 //!   stays one point (see [`GridArray::with_q_knots`](crate::gridpdf::GridArray::with_q_knots)).
-//!   Otherwise the stored binary64 Q² knots are used.
+//!   Otherwise the stored binary64 Q^2 knots are used.
 //!
 //! As in the binary64 path, a flavour that the set does not contain evaluates to zero.
 
@@ -28,9 +28,7 @@ use thiserror::Error;
 use crate::gridpdf::{ForcePositive, GridPDF};
 use crate::interpolator::InterpolationConfig;
 use crate::metadata::InterpolatorType;
-use crate::precision::{
-    Arithmetic, GridOptions, InterpolationError, LogBicubicGrid, LogCubicTable, ScaleAxis,
-};
+use crate::precision::{Arithmetic, InterpolationError, LogBicubicGrid, LogCubicTable};
 
 /// Errors of the precision-generic path; it never substitutes a value for a failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -79,65 +77,52 @@ impl<'a, A: Arithmetic + Clone> PrecisionPDF<'a, A> {
             .map(|(index, subgrid)| {
                 if !matches!(subgrid.interpolation_config(), InterpolationConfig::TwoD) {
                     return Err(PrecisionError::Unsupported(
-                        "subgrids beyond (x, Q²): nucleon, αs, kT, ξ or Δ dimensions".to_string(),
+                        "subgrids beyond (x, Q^2): nucleon, αs, kT, ξ or Δ dimensions".to_string(),
                     ));
                 }
                 let xs = subgrid.xs.as_slice().expect("contiguous x knots");
-                let (scale, options) = match knots.q_knots(index) {
-                    Some(qs) => (
-                        qs.to_vec(),
-                        GridOptions {
-                            scale_axis: ScaleAxis::Q,
-                            ..GridOptions::default()
-                        },
-                    ),
-                    None => (subgrid.q2s.to_vec(), GridOptions::default()),
-                };
-                let grid = subgrid.grid.view();
-                let is_8d = subgrid.is_8d();
-                // The flavour slot is the index into `knots.pids`, as in the binary64 path.
-                let value_at = |flavor: usize, ix: usize, iq: usize| {
-                    if is_8d {
-                        grid[[0, 0, 0, 0, 0, flavor, ix, iq]]
-                    } else {
-                        grid[[0, 0, flavor, 0, ix, iq]]
-                    }
-                };
-                let prepared = LogBicubicGrid::with_options(
-                    arithmetic.clone(),
-                    xs,
-                    &scale,
-                    flavors,
-                    value_at,
-                    options,
-                )?;
+                // The (x, Q^2) plane of each flavour slot (the index into `knots.pids`), as
+                // `SubGrid::grid_slice` lays it out for the binary64 path.
+                let planes: Vec<_> = (0..flavors).map(|f| subgrid.grid_slice(f)).collect();
+                let value_at = |flavor: usize, ix: usize, iq: usize| planes[flavor][[ix, iq]];
                 let a = &arithmetic;
-                let q2 = |q: f64| match options.scale_axis {
-                    ScaleAxis::Q => {
-                        let q = a.lift(q);
-                        a.mul(&q, &q)
+                let square = |q: f64| {
+                    let q = a.lift(q);
+                    a.mul(&q, &q)
+                };
+                // Original Q knots are squared in `arithmetic` (PDF and alpha_s thresholds given by
+                // the same Q stay identical); otherwise the stored Q^2 knots are used.
+                let (prepared, q2) = match knots.q_knots(index) {
+                    Some(qs) => (
+                        LogBicubicGrid::from_q_knots(
+                            arithmetic.clone(),
+                            xs,
+                            qs,
+                            flavors,
+                            value_at,
+                        )?,
+                        (square(qs[0]), square(qs[qs.len() - 1])),
+                    ),
+                    None => {
+                        let q2s = subgrid.q2s.as_slice().expect("contiguous Q^2 knots");
+                        (
+                            LogBicubicGrid::new(arithmetic.clone(), xs, q2s, flavors, value_at)?,
+                            (a.lift(q2s[0]), a.lift(q2s[q2s.len() - 1])),
+                        )
                     }
-                    ScaleAxis::QSquared => a.lift(q),
                 };
                 Ok(PreparedSubgrid {
                     grid: prepared,
                     x: (a.lift(xs[0]), a.lift(xs[xs.len() - 1])),
-                    q2: (q2(scale[0]), q2(scale[scale.len() - 1])),
+                    q2,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let alphas = if info.alphas_vals.is_empty() {
             None
         } else {
-            // The binary64 path keeps the first of repeated threshold knots (`AlphaSInterpol`).
-            let (qs, values): (Vec<f64>, Vec<f64>) = info
-                .alphas_q_values
-                .iter()
-                .zip(&info.alphas_vals)
-                .enumerate()
-                .filter(|(i, (q, _))| *i == 0 || **q != info.alphas_q_values[i - 1])
-                .map(|(_, (q, value))| (*q, *value))
-                .unzip();
+            // The same knots as the binary64 path (repeated threshold Q knots reduced to the first).
+            let (qs, values) = crate::alphas::alphas_knots(info);
             Some(LogCubicTable::from_q_knots(
                 arithmetic.clone(),
                 &qs,
@@ -154,8 +139,8 @@ impl<'a, A: Arithmetic + Clone> PrecisionPDF<'a, A> {
 }
 
 impl<A: Arithmetic> PrecisionPDF<'_, A> {
-    /// `x f(x, Q²)` of flavour `pid` (PDG code, 0 for the gluon), as [`crate::pdf::PDF::xfxq2`]
-    /// with the points `[x, Q²]`.
+    /// `x f(x, Q^2)` of flavour `pid` (PDG code, 0 for the gluon), as [`crate::pdf::PDF::xfxq2`]
+    /// with the points `[x, Q^2]`.
     pub fn xfxq2(
         &self,
         pid: i32,
@@ -178,7 +163,7 @@ impl<A: Arithmetic> PrecisionPDF<'_, A> {
         })
     }
 
-    /// `αs(Q²)` from the set's table, as [`crate::pdf::PDF::alphas_q2`].
+    /// `αs(Q^2)` from the set's table, as [`crate::pdf::PDF::alphas_q2`].
     pub fn alphas_q2(&self, q2: &A::Scalar) -> Result<A::Scalar, PrecisionError> {
         let table = self.alphas.as_ref().ok_or_else(|| {
             PrecisionError::Unsupported("analytic αs (only tabulated αs)".to_string())
@@ -186,8 +171,9 @@ impl<A: Arithmetic> PrecisionPDF<'_, A> {
         Ok(table.evaluate(q2)?)
     }
 
-    /// The subgrid of `(x, Q²)`: the first that contains it (bounds inclusive), as
-    /// `GridArray::find_subgrid` selects in binary64.
+    /// The subgrid that evaluates `(x, Q^2)`: the first subgrid, in the set's order, whose x range and
+    /// Q^2 range both contain the point, bounds included. This is the subgrid the binary64 path uses
+    /// for the same point; a point outside every subgrid is an error (no extrapolation).
     fn locate(
         &self,
         x: &A::Scalar,
